@@ -4,16 +4,15 @@ import pandas as pd
 from datetime import datetime, timedelta
 import plotly.express as px
 
-
-# -------------------------------------------------
+# ---------------------------------
 # CONFIG DE BASE
-# -------------------------------------------------
+# ---------------------------------
 
 DATASET_ID = "donnees-synop-essentielles-omm"
-BASE_DATA_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}"
-BASE_META_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}/fields"
+BASE_CATALOG_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}"
+BASE_RECORDS_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}/records"
 
-# Stations qu'on teste
+# Stations à tester manuellement (code OMM supposé → label humain)
 STATIONS = {
     "07110": "BREST",
     "07630": "PARIS-MONTSOURIS",
@@ -21,135 +20,168 @@ STATIONS = {
 }
 
 
-# -------------------------------------------------
-# 1. RÉCUPÉRATION DES MÉTADONNÉES DE CHAMPS
-# -------------------------------------------------
+# ---------------------------------
+# 1. MÉTADONNÉES DU DATASET
+# ---------------------------------
 
 @st.cache_data(ttl=3600)
-def get_fields():
+def get_schema():
     """
-    Va lire la description des colonnes exposées par l'API Opendatasoft
-    pour ce dataset. On récupère le 'name' technique de chaque champ.
+    Récupère les métadonnées complètes du dataset, y compris ses 'fields'.
+    On utilise include_schema=true parce que /fields n'existe pas sur ce domaine.
+    Retourne un DataFrame des champs techniques (name, type, label).
     """
-    r = requests.get(BASE_META_URL, timeout=30)
+    params = {
+        "include_schema": "true",
+    }
+    r = requests.get(BASE_CATALOG_URL, params=params, timeout=30)
+
     if r.status_code != 200:
         st.error(
-            f"❌ Erreur récupération métadonnées champs (HTTP {r.status_code}).\n"
-            f"URL: {BASE_META_URL}\nRéponse: {r.text[:500]}"
+            f"❌ Erreur récupération schéma (HTTP {r.status_code}).\n"
+            f"URL: {r.url}\nRéponse: {r.text[:500]}"
         )
         return pd.DataFrame()
 
-    data = r.json()  # c'est censé être une liste de champs
-    df = pd.DataFrame(data)
+    catalog_json = r.json()
 
-    # On affiche dans l'UI plus tard pour debug
-    return df
+    # Sur Opendatasoft explore v2.1, la réponse du /catalog/datasets/<id>
+    # contient typiquement { "dataset": {... "fields": [ {...}, {...} ] } }
+    dataset_info = catalog_json.get("dataset", {})
+    fields = dataset_info.get("fields", [])
+
+    df_fields = pd.DataFrame(fields)
+    # df_fields devrait avoir au moins: name (nom technique), type, label (nom lisible)
+    return df_fields
 
 
 def guess_columns(fields_df: pd.DataFrame):
     """
-    À partir de la liste des champs techniques de l'API, on essaie d'identifier :
-    - col_date            (horodatage UTC)
-    - col_station_id      (code station OMM)
-    - col_station_name    (nom lisible)
-    - col_temp            (température en Kelvin)
-    - col_rain            (pluie cumulée)
-    - col_wind            (vent moyen)
+    À partir de la liste des champs techniques renvoyés par le schéma,
+    on essaie de deviner quelles colonnes correspondent à quoi.
 
-    On fait ça par heuristique (recherche de bouts de mots).
+    On cherche :
+    - date_col : horodatage
+    - station_id_col : identifiant station OMM
+    - station_name_col : nom humain de la station
+    - temp_col : température
+    - rain_col : pluie
+    - wind_col : vent moyen
+
+    Heuristiques textuelles : on matche sur .lower()
     """
-    # normaliser pour chercher
-    def find_col(candidates_substrings, must_contain_all=False):
-        for fname in fields_df["name"]:
-            low = fname.lower()
-            if must_contain_all:
-                if all(sub in low for sub in candidates_substrings):
-                    return fname
+    if fields_df.empty:
+        return {}
+
+    def find_field(candidates_substrings, must_all=False):
+        for _, row in fields_df.iterrows():
+            fname = str(row.get("name", "")).lower()
+            if must_all:
+                if all(sub in fname for sub in candidates_substrings):
+                    return row.get("name")
             else:
-                if any(sub in low for sub in candidates_substrings):
-                    return fname
+                if any(sub in fname for sub in candidates_substrings):
+                    return row.get("name")
         return None
 
-    col_date         = find_col(["date"])  # souvent "date"
-    col_station_id   = find_col(["omm", "station"], must_contain_all=True) or find_col(["omm"])
-    col_station_name = find_col(["station"])
-    col_temp         = find_col(["temp"])      # "temperature"
-    col_rain         = find_col(["rain", "pluie", "precip"])
-    col_wind         = find_col(["wind", "vent", "ff"])
+    # champs temps
+    date_col = find_field(["date", "time", "datetime"])
 
-    # petit correctif : le nom "station" sert parfois pour le nom humain.
-    # mais si col_station_id == col_station_name, on va essayer d'être plus fin.
-    if col_station_id == col_station_name:
-        # on va réessayer station_id en cherchant "id" dedans
-        maybe_id = [n for n in fields_df["name"] if "omm" in n.lower() or "id" in n.lower()]
-        if maybe_id:
-            col_station_id = maybe_id[0]
+    # ID station : souvent contient "omm" ou "station" ou "id"
+    station_id_col = (
+        find_field(["omm", "station", "id"], must_all=True)
+        or find_field(["omm", "station"])
+        or find_field(["station", "id"])
+        or find_field(["omm"])
+    )
+
+    # nom station : souvent juste "station", "name"
+    station_name_col = find_field(["station", "name"]) or find_field(["station"])
+
+    # température
+    temp_col = find_field(["temp"]) or find_field(["temperat"])
+
+    # pluie
+    rain_col = (
+        find_field(["rain"])
+        or find_field(["pluie"])
+        or find_field(["precip"])
+    )
+
+    # vent
+    wind_col = (
+        find_field(["wind"])
+        or find_field(["vent"])
+        or find_field(["ff"])  # ff = vent moyen en m/s sur les SYNOP
+    )
+
+    # Nettoyage : si station_id_col == station_name_col, essaie de raffiner
+    if station_id_col == station_name_col:
+        # on cherche explicitement "id" ou "omm"
+        refine = find_field(["omm"]) or find_field(["id"])
+        if refine:
+            station_id_col = refine
 
     return {
-        "date": col_date,
-        "station_id": col_station_id,
-        "station_name": col_station_name,
-        "temp": col_temp,
-        "rain": col_rain,
-        "wind": col_wind,
+        "date": date_col,
+        "station_id": station_id_col,
+        "station_name": station_name_col,
+        "temp": temp_col,
+        "rain": rain_col,
+        "wind": wind_col,
     }
 
 
-# -------------------------------------------------
+# ---------------------------------
 # 2. RÉCUPÉRATION DES MESURES
-# -------------------------------------------------
+# ---------------------------------
 
 def fetch_data_for_station(cols_map, station_id, start_dt, end_dt, limit):
     """
-    Va chercher les données météo depuis l'API Opendatasoft pour une station et une période,
-    en utilisant les noms RÉELS des colonnes (cols_map).
+    Récupère les enregistrements météo pour une station et une période.
+    Utilise les noms techniques détectés dans cols_map.
     """
-
-    # Vérif minimum : il nous faut au moins la date et l'id station
-    if not cols_map["date"] or not cols_map["station_id"]:
-        st.error("❌ Impossible d'identifier les colonnes 'date' ou 'station_id' depuis les métadonnées.")
+    # sécurité minimale
+    if not cols_map.get("date") or not cols_map.get("station_id"):
+        st.error("❌ Pas de colonne 'date' ou 'station_id' détectée dans le schéma.")
         return pd.DataFrame()
 
-    url = f"{BASE_DATA_URL}/records"
+    date_col_api = cols_map["date"]
+    id_col_api = cols_map["station_id"]
 
+    # horodatages ISO8601 en UTC avec 'Z'
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # Construction dynamique du WHERE
-    # Attention : les noms de colonnes techniques n'ont en général PAS besoin de backticks s'ils sont déjà safe,
-    # mais on va les backticher par sécurité. Si l'API râle encore, on essaiera sans.
-    col_date_api = cols_map["date"]
-    col_id_api = cols_map["station_id"]
-
+    # On backtick systématiquement les noms de champs car certains peuvent contenir des espaces.
     where_clause = (
-        f"`{col_id_api}` = '{station_id}' "
-        f"AND `{col_date_api}` >= '{start_iso}' "
-        f"AND `{col_date_api}` <= '{end_iso}'"
+        f"`{id_col_api}` = '{station_id}' "
+        f"AND `{date_col_api}` >= '{start_iso}' "
+        f"AND `{date_col_api}` <= '{end_iso}'"
     )
 
-    # Construction du SELECT dynamique
     select_parts = [
-        f"`{col_date_api}` as date_utc",
-        f"`{col_id_api}` as station_id",
+        f"`{date_col_api}` as date_utc",
+        f"`{id_col_api}` as station_id",
     ]
 
-    if cols_map["station_name"]:
+    if cols_map.get("station_name"):
         select_parts.append(f"`{cols_map['station_name']}` as station_name")
-    if cols_map["temp"]:
+    if cols_map.get("temp"):
         select_parts.append(f"`{cols_map['temp']}` as temperature_raw")
-    if cols_map["rain"]:
+    if cols_map.get("rain"):
         select_parts.append(f"`{cols_map['rain']}` as rain_raw")
-    if cols_map["wind"]:
+    if cols_map.get("wind"):
         select_parts.append(f"`{cols_map['wind']}` as wind_raw")
 
     params = {
         "where": where_clause,
         "limit": limit,  # max 100
-        "order_by": f"`{col_date_api}` ASC",
+        "order_by": f"`{date_col_api}` ASC",
         "select": ", ".join(select_parts),
     }
 
-    r = requests.get(url, params=params, timeout=30)
+    r = requests.get(BASE_RECORDS_URL, params=params, timeout=30)
 
     if r.status_code != 200:
         st.error(
@@ -170,17 +202,16 @@ def fetch_data_for_station(cols_map, station_id, start_dt, end_dt, limit):
 
 def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Nettoie les colonnes récupérées :
-    - parse la date UTC
-    - convertit en heure locale Europe/Paris
-    - essaie de convertir temperature_raw K -> °C si ça ressemble à du Kelvin
+    - parse date_utc -> datetime TZ-aware
+    - convertit en Europe/Paris
+    - convertit temperature_raw en °C si ça ressemble à du Kelvin
+    - garde pluie et vent bruts pour visualisation
     """
     if df.empty:
         return df
 
     out = pd.DataFrame()
 
-    # horodatage
     if "date_utc" in df.columns:
         out["date_utc"] = pd.to_datetime(df["date_utc"], errors="coerce", utc=True)
         out["date_local"] = out["date_utc"].dt.tz_convert("Europe/Paris")
@@ -188,37 +219,36 @@ def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
         out["date_utc"] = pd.NaT
         out["date_local"] = pd.NaT
 
-    # station
     out["station_id"] = df.get("station_id")
     out["station_name"] = df.get("station_name")
 
-    # température
+    # Température
     if "temperature_raw" in df.columns:
-        temp_series = pd.to_numeric(df["temperature_raw"], errors="coerce")
-        # heuristique Kelvin -> °C (si >200 on assume Kelvin, sinon déjà °C)
-        out["temperature_C"] = temp_series.where(temp_series < 200, temp_series - 273.15)
+        t_raw = pd.to_numeric(df["temperature_raw"], errors="coerce")
+        # heuristique Kelvin -> °C
+        out["temperature_C"] = t_raw.where(t_raw < 200, t_raw - 273.15)
     else:
         out["temperature_C"] = None
 
-    # pluie brute
+    # Pluie brute
     if "rain_raw" in df.columns:
-        out["pluie_raw"] = pd.to_numeric(df["rain_raw"], errors="coerce")
+        out["pluie_brute"] = pd.to_numeric(df["rain_raw"], errors="coerce")
     else:
-        out["pluie_raw"] = None
+        out["pluie_brute"] = None
 
-    # vent brut
+    # Vent brut
     if "wind_raw" in df.columns:
-        out["vent_moyen_raw"] = pd.to_numeric(df["wind_raw"], errors="coerce")
+        out["vent_brut"] = pd.to_numeric(df["wind_raw"], errors="coerce")
     else:
-        out["vent_moyen_raw"] = None
+        out["vent_brut"] = None
 
     out = out.sort_values("date_local").reset_index(drop=True)
     return out
 
 
-# -------------------------------------------------
-# CONFIG STREAMLIT / UI
-# -------------------------------------------------
+# ---------------------------------
+# 3. UI STREAMLIT
+# ---------------------------------
 
 st.set_page_config(
     page_title="Météo live SYNOP",
@@ -228,26 +258,28 @@ st.set_page_config(
 
 st.title("🌦️ Météo live (SYNOP / Opendatasoft)")
 st.caption(
-    "On récupère d'abord la structure du dataset (noms réels des colonnes), "
-    "puis on interroge les mesures pour la station choisie."
+    "On récupère le schéma réel du dataset via include_schema=true, "
+    "on devine les colonnes techniques, puis on interroge les mesures pour la station choisie."
 )
 
-fields_df = get_fields()
-if fields_df.empty:
+# Récup schéma
+schema_df = get_schema()
+if schema_df.empty:
     st.stop()
 
-cols_map = guess_columns(fields_df)
+cols_map = guess_columns(schema_df)
 
-with st.expander("Debug: champs détectés dans le dataset"):
-    st.write("Champs exposés par l'API :")
-    st.dataframe(fields_df[["name", "type", "label"]], use_container_width=True)
-    st.write("Mapping détecté pour les colonnes clés :")
+with st.expander("🔎 Debug schéma détecté"):
+    st.write("Champs exposés par l'API (nom technique = 'name') :")
+    show_cols = [c for c in ["name", "type", "label", "description"] if c in schema_df.columns]
+    st.dataframe(schema_df[show_cols], use_container_width=True)
+    st.write("Mapping heuristique pour les colonnes clés :")
     st.json(cols_map)
 
 with st.sidebar:
     st.header("⚙️ Paramètres")
 
-    # 1. Choix station
+    # Choix station
     station_codes = list(STATIONS.keys())
     station_labels = [f"{STATIONS[c]} ({c})" for c in station_codes]
 
@@ -263,7 +295,7 @@ with st.sidebar:
     st.write(f"ID (station OMM supposé) : `{chosen_station_id}`")
     st.write(f"Nom affiché : {chosen_station_name}")
 
-    # 2. Période par défaut: dernières 48h
+    # Période par défaut = dernières 48h
     default_end = datetime.utcnow()
     default_start = default_end - timedelta(days=2)
 
@@ -273,7 +305,6 @@ with st.sidebar:
     start_hour = st.number_input("Heure début (0-23)", min_value=0, max_value=23, value=0)
     end_hour = st.number_input("Heure fin (0-23)", min_value=0, max_value=23, value=23)
 
-    # 3. Limit API
     limit = st.slider(
         "Nombre max de lignes (<=100)",
         min_value=10,
@@ -308,7 +339,7 @@ if run_query:
         synop_df = normalize_synop_df(raw_df)
 
     if synop_df.empty:
-        st.warning("Aucune donnée renvoyée (ou mapping colonnes encore faux).")
+        st.warning("Aucune donnée renvoyée (ou mapping pas encore bon).")
     else:
         st.subheader("Aperçu des données normalisées")
         st.dataframe(synop_df.tail(20), use_container_width=True)
@@ -319,7 +350,7 @@ if run_query:
                 synop_df,
                 x="date_local",
                 y="temperature_C",
-                title="Température (°C) estimée",
+                title="Température (°C estimée)",
                 markers=True,
             )
             fig_temp.update_layout(
@@ -329,26 +360,26 @@ if run_query:
             st.plotly_chart(fig_temp, use_container_width=True)
 
         # Pluie brute
-        if "pluie_raw" in synop_df.columns and synop_df["pluie_raw"].notna().any():
+        if "pluie_brute" in synop_df.columns and synop_df["pluie_brute"].notna().any():
             fig_rain = px.bar(
                 synop_df,
                 x="date_local",
-                y="pluie_raw",
-                title="Pluie brute (unité fournie API)",
+                y="pluie_brute",
+                title="Pluie (valeur brute retournée par l'API)",
             )
             fig_rain.update_layout(
                 xaxis_title="Heure (Europe/Paris)",
-                yaxis_title="Valeur pluie API",
+                yaxis_title="Pluie (unité API)",
             )
             st.plotly_chart(fig_rain, use_container_width=True)
 
         # Vent brut
-        if "vent_moyen_raw" in synop_df.columns and synop_df["vent_moyen_raw"].notna().any():
+        if "vent_brut" in synop_df.columns and synop_df["vent_brut"].notna().any():
             fig_wind = px.line(
                 synop_df,
                 x="date_local",
-                y="vent_moyen_raw",
-                title="Vent moyen brut (unité API)",
+                y="vent_brut",
+                title="Vent moyen (valeur brute API)",
                 markers=True,
             )
             fig_wind.update_layout(
@@ -363,9 +394,10 @@ else:
 
 with st.expander("Notes techniques"):
     st.markdown(
-        "- On interroge d'abord /fields pour découvrir les VRAIS noms backend des colonnes exposées par Opendatasoft. "
-        "C'est pour ça qu'on affiche un tableau 'Champs exposés par l'API'.\n"
-        "- Ensuite on reconstruit dynamiquement la requête `where` / `select`.\n"
-        "- Si ça marche, on saura exactement comment s'appellent les colonnes (ex: `id_omm_station`, `temperature`, etc.).\n"
-        "- Après ça, on pourra figer ces noms et passer en mode cache local."
+        "- On appelle maintenant /catalog/datasets/<id>?include_schema=true pour obtenir le schéma, "
+        "car /fields n'est pas exposé sur ce domaine.\n"
+        "- On détecte ensuite les colonnes probables par heuristique (date, température, pluie...).\n"
+        "- On s'en sert pour construire la requête dynamique sur /records.\n"
+        "- Dès que ça fonctionne et qu'on voit les bons noms (par ex. `id_omm_station`, `temperature`, etc.), "
+        "on pourra les figer en dur, enlever toute la détection, et passer à l'étape cache local."
     )
