@@ -11,16 +11,19 @@ import plotly.express as px
 DATASET_ID = "donnees-synop-essentielles-omm"
 BASE_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}"
 
-# Liste de stations en dur pour l’instant.
+# Stations disponibles (code OMM -> label humain)
 STATIONS = {
     "07110": "BREST",
     "07630": "PARIS-MONTSOURIS",
     "07761": "AJACCIO",
-    # ajoute tes stations ici
 }
 
-# Noms des colonnes EXACTS (avec espaces) côté Opendatasoft
-COL_DATE = "Date"
+# IMPORTANT :
+# D'après le dataset :
+# - La colonne temps est exposée comme "Date" dans l'export,
+#   mais son vrai nom backend est très probablement "date" (minuscule).
+# - Les autres colonnes gardent leurs libellés textuels.
+COL_DATE_BACKEND = "date"                 # backend sans espace
 COL_ID = "ID OMM station"
 COL_TEMP = "Temperature"
 COL_RAIN = "Rainfall 3 last hours"
@@ -28,35 +31,38 @@ COL_WIND = "Average wind 10 mn"
 COL_NAME = "Station"
 
 
-# ---------------------------------
-# FONCTIONS METEO
-# ---------------------------------
-
 def fetch_data_for_station(station_id: str, start_dt: datetime, end_dt: datetime, limit: int):
     """
     Récupère les enregistrements SYNOP pour une station donnée entre start_dt et end_dt.
-    limit doit être <= 100 (contrainte Opendatasoft v2.1).
-    On renvoie un DataFrame brut.
+    limit doit être <= 100 (limite Opendatasoft).
+    On renvoie un DataFrame brut (colonnes déjà renommées via 'select').
     """
     url = f"{BASE_URL}/records"
 
-    # Format ISO8601 UTC attendu par Opendatasoft
+    # Format horodatage attendu: UTC ISO8601 en Z
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # les champs avec espaces doivent être entourés de backticks `
+    # Clause WHERE :
+    #   `ID OMM station` = '07630'
+    #   AND `date` >= '...'
+    #   AND `date` <= '...'
+    #
+    # Remarque: `date` est sans espace car c'est le vrai nom technique.
     where_clause = (
         f"`{COL_ID}` = '{station_id}' "
-        f"AND `{COL_DATE}` >= '{start_iso}' "
-        f"AND `{COL_DATE}` <= '{end_iso}'"
+        f"AND `{COL_DATE_BACKEND}` >= '{start_iso}' "
+        f"AND `{COL_DATE_BACKEND}` <= '{end_iso}'"
     )
 
+    # Construction du paramètre select :
+    # On redonne des alias Python-friendly pour derrière
     params = {
         "where": where_clause,
-        "limit": limit,  # <= 100 obligatoire
-        "order_by": f"`{COL_DATE}` ASC",
+        "limit": limit,  # max 100
+        "order_by": f"`{COL_DATE_BACKEND}` ASC",
         "select": (
-            f"`{COL_DATE}` as date_utc, "
+            f"`{COL_DATE_BACKEND}` as date_utc, "
             f"`{COL_ID}` as station_id, "
             f"`{COL_NAME}` as station_name, "
             f"`{COL_TEMP}` as temperature_K, "
@@ -86,17 +92,17 @@ def fetch_data_for_station(station_id: str, start_dt: datetime, end_dt: datetime
 
 def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Nettoie les colonnes :
-    - parse dates utc -> local (Europe/Paris)
+    Prépare les colonnes pour l'affichage :
+    - parse la date UTC -> Europe/Paris
     - Kelvin -> °C
-    - renomme pluie/vent
+    - Renomme la pluie et le vent
     """
     if df.empty:
         return df
 
     out = pd.DataFrame()
 
-    # horodatage
+    # horodatage UTC brut de l'API
     if "date_utc" in df.columns:
         out["date_utc"] = pd.to_datetime(df["date_utc"], errors="coerce", utc=True)
         out["date_local"] = out["date_utc"].dt.tz_convert("Europe/Paris")
@@ -104,11 +110,11 @@ def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
         out["date_utc"] = pd.NaT
         out["date_local"] = pd.NaT
 
-    # infos station
+    # identifiant / nom de station
     out["station_id"] = df.get("station_id")
     out["station_name"] = df.get("station_name")
 
-    # température K -> °C
+    # température : Kelvin -> °C
     if "temperature_K" in df.columns:
         out["temperature_C"] = pd.to_numeric(df["temperature_K"], errors="coerce") - 273.15
     else:
@@ -120,7 +126,7 @@ def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["pluie_mm_3h"] = None
 
-    # vent moyen 10 min (m/s)
+    # vent moyen 10 min
     if "wind_avg_ms" in df.columns:
         out["vent_moyen_m_s"] = pd.to_numeric(df["wind_avg_ms"], errors="coerce")
     else:
@@ -142,7 +148,8 @@ st.set_page_config(
 
 st.title("🌦️ Météo live (SYNOP / Opendatasoft)")
 st.caption(
-    "Sélectionne une station et une période. On tape l’API en direct et on trace température / pluie / vent."
+    "Sélectionne une station et une période. On interroge l'API publique Opendatasoft en direct "
+    "et on trace température / pluie / vent."
 )
 
 # ---------------------------------
@@ -152,7 +159,7 @@ st.caption(
 with st.sidebar:
     st.header("⚙️ Paramètres")
 
-    # 1. Choix de la station
+    # 1. Choix station
     station_codes = list(STATIONS.keys())
     station_labels = [f"{STATIONS[c]} ({c})" for c in station_codes]
 
@@ -196,7 +203,7 @@ with st.sidebar:
 # ---------------------------------
 
 if run_query:
-    # reconstituer les timestamps UTC complets
+    # Construit les timestamps UTC complets
     start_dt = datetime(
         year=start_date.year,
         month=start_date.month,
@@ -225,7 +232,7 @@ if run_query:
         st.subheader("Aperçu des données (normalisées)")
         st.dataframe(synop_df.tail(20), use_container_width=True)
 
-        # --------- Température (°C)
+        # Température (°C)
         if "temperature_C" in synop_df.columns and synop_df["temperature_C"].notna().any():
             fig_temp = px.line(
                 synop_df,
@@ -240,9 +247,9 @@ if run_query:
             )
             st.plotly_chart(fig_temp, use_container_width=True)
         else:
-            st.info("Pas de temperature exploitable.")
+            st.info("Pas de température exploitable.")
 
-        # --------- Pluie cumulée 3h (mm)
+        # Pluie cumulée sur 3h (mm)
         if "pluie_mm_3h" in synop_df.columns and synop_df["pluie_mm_3h"].notna().any():
             fig_rain = px.bar(
                 synop_df,
@@ -258,7 +265,7 @@ if run_query:
         else:
             st.info("Pas de pluie mesurée (ou champ absent).")
 
-        # --------- Vent moyen 10 min (m/s)
+        # Vent moyen (m/s)
         if "vent_moyen_m_s" in synop_df.columns and synop_df["vent_moyen_m_s"].notna().any():
             fig_wind = px.line(
                 synop_df,
@@ -287,9 +294,10 @@ with st.expander("Détails techniques / debug"):
     st.write("Dataset utilisé :", DATASET_ID)
     st.write("URL base API :", BASE_URL)
     st.markdown(
-        "- Les colonnes du dataset ont des espaces, donc on les entoure avec des backticks ` dans le where.\n"
-        "- Température fournie en Kelvin -> convertie en °C.\n"
-        "- Pluie dispo en cumul 3h (pas toujours 1h).\n"
+        "- Le champ temps du dataset s'appelle visuellement 'Date' mais techniquement 'date' dans l'API Opendatasoft. "
+        "On filtre et on trie donc sur `date`.\n"
+        "- Température fournie en Kelvin → convertie en °C.\n"
+        "- Pluie = cumul des 3 dernières heures.\n"
         "- Vent = vent moyen 10 minutes (m/s).\n"
-        "- L'API limite 'limit' à 100 lignes max par appel."
+        "- L'API limite chaque appel à 100 lignes max."
     )
