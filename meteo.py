@@ -4,120 +4,107 @@ import pandas as pd
 from datetime import datetime, timedelta
 import plotly.express as px
 
-# ---------------------------------
-# CONFIG DE BASE
-# ---------------------------------
-
 DATASET_ID = "donnees-synop-essentielles-omm"
 BASE_CATALOG_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}"
 BASE_RECORDS_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}/records"
 
-# Stations à tester manuellement (code OMM supposé → label humain)
 STATIONS = {
     "07110": "BREST",
     "07630": "PARIS-MONTSOURIS",
     "07761": "AJACCIO",
 }
 
+st.set_page_config(
+    page_title="Météo live SYNOP",
+    page_icon="🌦️",
+    layout="wide",
+)
 
-# ---------------------------------
-# 1. MÉTADONNÉES DU DATASET
-# ---------------------------------
+st.title("🌦️ Météo live (SYNOP / Opendatasoft)")
+st.caption(
+    "On tente d'interroger le schéma réel du dataset + les mesures météo d'une station. "
+    "Si ça ne remonte rien, on affiche tout ce qu'on sait en debug."
+)
+
+# -------------------------------------------------
+# 1. FONCTIONS UTILITAIRES
+# -------------------------------------------------
 
 @st.cache_data(ttl=3600)
-def get_schema():
+def raw_get_schema_json():
     """
-    Récupère les métadonnées complètes du dataset, y compris ses 'fields'.
-    On utilise include_schema=true parce que /fields n'existe pas sur ce domaine.
-    Retourne un DataFrame des champs techniques (name, type, label).
+    On ne fait plus d'hypothèse sur la structure.
+    On renvoie le JSON brut de /catalog/datasets?include_schema=true
+    + on laisse l'appelant se débrouiller.
     """
-    params = {
-        "include_schema": "true",
-    }
+    params = {"include_schema": "true"}
     r = requests.get(BASE_CATALOG_URL, params=params, timeout=30)
+    return {
+        "status_code": r.status_code,
+        "url": r.url,
+        "text": r.text[:1000],  # on tronque pour éviter le pâté énorme
+        "json": (r.json() if r.headers.get("Content-Type", "").startswith("application/json") else None),
+    }
 
-    if r.status_code != 200:
-        st.error(
-            f"❌ Erreur récupération schéma (HTTP {r.status_code}).\n"
-            f"URL: {r.url}\nRéponse: {r.text[:500]}"
-        )
+def extract_fields_df(schema_payload):
+    """
+    Essaie d'extraire la liste des champs sous forme de DataFrame,
+    quel que soit le format retourné.
+    On est tolérant : si on ne trouve pas, on renvoie un DF vide.
+    """
+    if not schema_payload:
         return pd.DataFrame()
 
-    catalog_json = r.json()
+    js = schema_payload.get("json")
+    if not isinstance(js, dict):
+        return pd.DataFrame()
 
-    # Sur Opendatasoft explore v2.1, la réponse du /catalog/datasets/<id>
-    # contient typiquement { "dataset": {... "fields": [ {...}, {...} ] } }
-    dataset_info = catalog_json.get("dataset", {})
-    fields = dataset_info.get("fields", [])
+    # On essaie différentes clés possibles :
+    # 1) structure attendue: {"dataset": {"fields": [ {...}, {...} ]}}
+    if "dataset" in js and isinstance(js["dataset"], dict):
+        maybe_fields = js["dataset"].get("fields")
+        if isinstance(maybe_fields, list):
+            return pd.DataFrame(maybe_fields)
 
-    df_fields = pd.DataFrame(fields)
-    # df_fields devrait avoir au moins: name (nom technique), type, label (nom lisible)
-    return df_fields
+    # 2) parfois c'est renvoyé direct: {"fields": [...]}
+    if "fields" in js and isinstance(js["fields"], list):
+        return pd.DataFrame(js["fields"])
 
+    # 3) fallback : rien trouvé
+    return pd.DataFrame()
 
 def guess_columns(fields_df: pd.DataFrame):
     """
-    À partir de la liste des champs techniques renvoyés par le schéma,
-    on essaie de deviner quelles colonnes correspondent à quoi.
-
-    On cherche :
-    - date_col : horodatage
-    - station_id_col : identifiant station OMM
-    - station_name_col : nom humain de la station
-    - temp_col : température
-    - rain_col : pluie
-    - wind_col : vent moyen
-
-    Heuristiques textuelles : on matche sur .lower()
+    Heuristique pour repérer les colonnes utiles.
+    Si on ne trouve rien, on renvoie juste {}
     """
-    if fields_df.empty:
+    if fields_df.empty or "name" not in fields_df.columns:
         return {}
 
-    def find_field(candidates_substrings, must_all=False):
-        for _, row in fields_df.iterrows():
-            fname = str(row.get("name", "")).lower()
+    def find_field(substr_list, must_all=False):
+        for name in fields_df["name"]:
+            low = str(name).lower()
             if must_all:
-                if all(sub in fname for sub in candidates_substrings):
-                    return row.get("name")
+                if all(sub in low for sub in substr_list):
+                    return name
             else:
-                if any(sub in fname for sub in candidates_substrings):
-                    return row.get("name")
+                if any(sub in low for sub in substr_list):
+                    return name
         return None
 
-    # champs temps
     date_col = find_field(["date", "time", "datetime"])
-
-    # ID station : souvent contient "omm" ou "station" ou "id"
     station_id_col = (
         find_field(["omm", "station", "id"], must_all=True)
         or find_field(["omm", "station"])
         or find_field(["station", "id"])
         or find_field(["omm"])
     )
-
-    # nom station : souvent juste "station", "name"
     station_name_col = find_field(["station", "name"]) or find_field(["station"])
-
-    # température
     temp_col = find_field(["temp"]) or find_field(["temperat"])
+    rain_col = find_field(["rain", "pluie", "precip"])
+    wind_col = find_field(["wind", "vent", "ff"])
 
-    # pluie
-    rain_col = (
-        find_field(["rain"])
-        or find_field(["pluie"])
-        or find_field(["precip"])
-    )
-
-    # vent
-    wind_col = (
-        find_field(["wind"])
-        or find_field(["vent"])
-        or find_field(["ff"])  # ff = vent moyen en m/s sur les SYNOP
-    )
-
-    # Nettoyage : si station_id_col == station_name_col, essaie de raffiner
     if station_id_col == station_name_col:
-        # on cherche explicitement "id" ou "omm"
         refine = find_field(["omm"]) or find_field(["id"])
         if refine:
             station_id_col = refine
@@ -131,29 +118,27 @@ def guess_columns(fields_df: pd.DataFrame):
         "wind": wind_col,
     }
 
-
-# ---------------------------------
-# 2. RÉCUPÉRATION DES MESURES
-# ---------------------------------
-
 def fetch_data_for_station(cols_map, station_id, start_dt, end_dt, limit):
     """
-    Récupère les enregistrements météo pour une station et une période.
-    Utilise les noms techniques détectés dans cols_map.
+    Appel /records pour récupérer les lignes météo.
+    On construit la requête avec les noms de colonnes trouvés.
+    Si cols_map est incomplet -> on renvoie DataFrame vide + message.
     """
-    # sécurité minimale
-    if not cols_map.get("date") or not cols_map.get("station_id"):
-        st.error("❌ Pas de colonne 'date' ou 'station_id' détectée dans le schéma.")
+    if not cols_map:
+        st.error("❌ Pas de mapping de colonnes (le schéma est vide).")
         return pd.DataFrame()
 
-    date_col_api = cols_map["date"]
-    id_col_api = cols_map["station_id"]
+    date_col_api = cols_map.get("date")
+    id_col_api = cols_map.get("station_id")
 
-    # horodatages ISO8601 en UTC avec 'Z'
+    if not date_col_api or not id_col_api:
+        st.error(f"❌ Colonnes critiques manquantes. date={date_col_api}, station_id={id_col_api}")
+        return pd.DataFrame()
+
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # On backtick systématiquement les noms de champs car certains peuvent contenir des espaces.
+    # where dynamique
     where_clause = (
         f"`{id_col_api}` = '{station_id}' "
         f"AND `{date_col_api}` >= '{start_iso}' "
@@ -176,36 +161,33 @@ def fetch_data_for_station(cols_map, station_id, start_dt, end_dt, limit):
 
     params = {
         "where": where_clause,
-        "limit": limit,  # max 100
+        "limit": limit,
         "order_by": f"`{date_col_api}` ASC",
         "select": ", ".join(select_parts),
     }
 
     r = requests.get(BASE_RECORDS_URL, params=params, timeout=30)
 
+    # On remonte TOUJOURS le statut et la réponse, même si 200,
+    # pour qu'on voie enfin ce que l'API retourne réellement
+    st.write("🛰️ DEBUG /records status_code:", r.status_code)
+    st.write("🛰️ DEBUG URL appelée:", r.url)
+    st.write("🛰️ DEBUG réponse (début):", r.text[:500])
+
     if r.status_code != 200:
-        st.error(
-            f"❌ Erreur API mesures (HTTP {r.status_code}).\n"
-            f"URL: {r.url}\n"
-            f"Réponse: {r.text[:500]}"
-        )
         return pd.DataFrame()
 
     try:
-        results = r.json().get("results", [])
-    except Exception as e:
-        st.error(f"❌ Réponse JSON illisible. Détail: {e}")
+        data_json = r.json()
+    except Exception:
         return pd.DataFrame()
 
+    results = data_json.get("results", [])
     return pd.DataFrame(results)
-
 
 def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    - parse date_utc -> datetime TZ-aware
-    - convertit en Europe/Paris
-    - convertit temperature_raw en °C si ça ressemble à du Kelvin
-    - garde pluie et vent bruts pour visualisation
+    Transforme la réponse brute en colonnes prêtes à afficher.
     """
     if df.empty:
         return df
@@ -222,21 +204,17 @@ def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
     out["station_id"] = df.get("station_id")
     out["station_name"] = df.get("station_name")
 
-    # Température
     if "temperature_raw" in df.columns:
         t_raw = pd.to_numeric(df["temperature_raw"], errors="coerce")
-        # heuristique Kelvin -> °C
         out["temperature_C"] = t_raw.where(t_raw < 200, t_raw - 273.15)
     else:
         out["temperature_C"] = None
 
-    # Pluie brute
     if "rain_raw" in df.columns:
         out["pluie_brute"] = pd.to_numeric(df["rain_raw"], errors="coerce")
     else:
         out["pluie_brute"] = None
 
-    # Vent brut
     if "wind_raw" in df.columns:
         out["vent_brut"] = pd.to_numeric(df["wind_raw"], errors="coerce")
     else:
@@ -246,40 +224,36 @@ def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ---------------------------------
-# 3. UI STREAMLIT
-# ---------------------------------
+# -------------------------------------------------
+# 2. CHARGER LE SCHÉMA + AFFICHER DEBUG
+# -------------------------------------------------
 
-st.set_page_config(
-    page_title="Météo live SYNOP",
-    page_icon="🌦️",
-    layout="wide",
-)
-
-st.title("🌦️ Météo live (SYNOP / Opendatasoft)")
-st.caption(
-    "On récupère le schéma réel du dataset via include_schema=true, "
-    "on devine les colonnes techniques, puis on interroge les mesures pour la station choisie."
-)
-
-# Récup schéma
-schema_df = get_schema()
-if schema_df.empty:
-    st.stop()
-
+schema_payload = raw_get_schema_json()
+schema_df = extract_fields_df(schema_payload)
 cols_map = guess_columns(schema_df)
 
-with st.expander("🔎 Debug schéma détecté"):
-    st.write("Champs exposés par l'API (nom technique = 'name') :")
-    show_cols = [c for c in ["name", "type", "label", "description"] if c in schema_df.columns]
-    st.dataframe(schema_df[show_cols], use_container_width=True)
-    st.write("Mapping heuristique pour les colonnes clés :")
+with st.expander("🔎 Debug schéma / colonnes"):
+    st.write("Réponse brute du schéma (/catalog … include_schema=true) :")
+    st.json(schema_payload)
+
+    st.write("DataFrame des champs détectés :")
+    if schema_df.empty:
+        st.warning("⚠ Pas de champs détectés (schema_df est vide).")
+    else:
+        show_cols = [c for c in ["name", "type", "label", "description"] if c in schema_df.columns]
+        st.dataframe(schema_df[show_cols], use_container_width=True)
+
+    st.write("Mapping heuristique actuel :")
     st.json(cols_map)
+
+
+# -------------------------------------------------
+# 3. SIDEBAR (PARAMÈTRES UTILISATEUR)
+# -------------------------------------------------
 
 with st.sidebar:
     st.header("⚙️ Paramètres")
 
-    # Choix station
     station_codes = list(STATIONS.keys())
     station_labels = [f"{STATIONS[c]} ({c})" for c in station_codes]
 
@@ -295,7 +269,6 @@ with st.sidebar:
     st.write(f"ID (station OMM supposé) : `{chosen_station_id}`")
     st.write(f"Nom affiché : {chosen_station_name}")
 
-    # Période par défaut = dernières 48h
     default_end = datetime.utcnow()
     default_start = default_end - timedelta(days=2)
 
@@ -309,12 +282,16 @@ with st.sidebar:
         "Nombre max de lignes (<=100)",
         min_value=10,
         max_value=100,
-        value=80,
+        value=50,
         step=10,
     )
 
     run_query = st.button("🔍 Charger les données")
 
+
+# -------------------------------------------------
+# 4. APPEL MESURES + PLOTS
+# -------------------------------------------------
 
 if run_query:
     start_dt = datetime(
@@ -334,18 +311,17 @@ if run_query:
         second=0,
     )
 
-    with st.spinner("Appel API en cours..."):
+    with st.spinner("Appel API mesures /records..."):
         raw_df = fetch_data_for_station(cols_map, chosen_station_id, start_dt, end_dt, limit)
         synop_df = normalize_synop_df(raw_df)
 
     if synop_df.empty:
-        st.warning("Aucune donnée renvoyée (ou mapping pas encore bon).")
+        st.warning("Aucune donnée renvoyée (ou mapping pas encore bon). Regarde le debug juste au-dessus.")
     else:
         st.subheader("Aperçu des données normalisées")
         st.dataframe(synop_df.tail(20), use_container_width=True)
 
-        # Température
-        if "temperature_C" in synop_df.columns and synop_df["temperature_C"].notna().any():
+        if synop_df["temperature_C"].notna().any():
             fig_temp = px.line(
                 synop_df,
                 x="date_local",
@@ -359,13 +335,12 @@ if run_query:
             )
             st.plotly_chart(fig_temp, use_container_width=True)
 
-        # Pluie brute
-        if "pluie_brute" in synop_df.columns and synop_df["pluie_brute"].notna().any():
+        if synop_df["pluie_brute"].notna().any():
             fig_rain = px.bar(
                 synop_df,
                 x="date_local",
                 y="pluie_brute",
-                title="Pluie (valeur brute retournée par l'API)",
+                title="Pluie (valeur brute API)",
             )
             fig_rain.update_layout(
                 xaxis_title="Heure (Europe/Paris)",
@@ -373,8 +348,7 @@ if run_query:
             )
             st.plotly_chart(fig_rain, use_container_width=True)
 
-        # Vent brut
-        if "vent_brut" in synop_df.columns and synop_df["vent_brut"].notna().any():
+        if synop_df["vent_brut"].notna().any():
             fig_wind = px.line(
                 synop_df,
                 x="date_local",
@@ -390,14 +364,3 @@ if run_query:
 
 else:
     st.info("➡ Choisis une station, une période et clique sur 'Charger les données'.")
-
-
-with st.expander("Notes techniques"):
-    st.markdown(
-        "- On appelle maintenant /catalog/datasets/<id>?include_schema=true pour obtenir le schéma, "
-        "car /fields n'est pas exposé sur ce domaine.\n"
-        "- On détecte ensuite les colonnes probables par heuristique (date, température, pluie...).\n"
-        "- On s'en sert pour construire la requête dynamique sur /records.\n"
-        "- Dès que ça fonctionne et qu'on voit les bons noms (par ex. `id_omm_station`, `temperature`, etc.), "
-        "on pourra les figer en dur, enlever toute la détection, et passer à l'étape cache local."
-    )
