@@ -4,190 +4,102 @@ import pandas as pd
 from datetime import datetime, timedelta
 import plotly.express as px
 
+# ------------------------------
+# CONFIG
+# ------------------------------
+
 DATASET_ID = "donnees-synop-essentielles-omm"
-BASE_CATALOG_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}"
 BASE_RECORDS_URL = f"https://public.opendatasoft.com/api/explore/v2.1/catalog/datasets/{DATASET_ID}/records"
 
+# Dictionnaire station_id -> label humain
+# ATTENTION: maintenant on sait que la colonne station côté API s'appelle numer_sta
+# donc les clés ici doivent correspondre à numer_sta.
 STATIONS = {
     "07110": "BREST",
     "07630": "PARIS-MONTSOURIS",
     "07761": "AJACCIO",
 }
 
-st.set_page_config(
-    page_title="Météo live SYNOP",
-    page_icon="🌦️",
-    layout="wide",
-)
+# Champs confirmés dans le dataset :
+COL_STATION_ID = "numer_sta"   # code OMM station
+COL_DATE       = "date"        # horodatage UTC
+COL_TEMP       = "tc"          # Température (°C)
+COL_RAIN_1H    = "rr1"         # Précipitations dernière heure (mm)
+COL_WIND       = "ff"          # Vitesse vent moyen 10 mn (m/s)
+COL_NAME       = "nom"         # Nom humain de la station
 
-st.title("🌦️ Météo live (SYNOP / Opendatasoft)")
-st.caption(
-    "On tente d'interroger le schéma réel du dataset + les mesures météo d'une station. "
-    "Si ça ne remonte rien, on affiche tout ce qu'on sait en debug."
-)
 
-# -------------------------------------------------
-# 1. FONCTIONS UTILITAIRES
-# -------------------------------------------------
+# ------------------------------
+# FONCTION APPEL API
+# ------------------------------
 
-@st.cache_data(ttl=3600)
-def raw_get_schema_json():
+def fetch_data_for_station(station_id, start_dt, end_dt, limit):
     """
-    On ne fait plus d'hypothèse sur la structure.
-    On renvoie le JSON brut de /catalog/datasets?include_schema=true
-    + on laisse l'appelant se débrouiller.
+    Récupère les observations météo depuis l'API Opendatasoft pour une station OMM donnée (numer_sta),
+    filtrées entre start_dt et end_dt (UTC), triées par date.
+    On récupère uniquement les colonnes utiles : date, tc, rr1, ff, nom.
+    limit doit être <= 100 (contrainte API).
     """
-    params = {"include_schema": "true"}
-    r = requests.get(BASE_CATALOG_URL, params=params, timeout=30)
-    return {
-        "status_code": r.status_code,
-        "url": r.url,
-        "text": r.text[:1000],  # on tronque pour éviter le pâté énorme
-        "json": (r.json() if r.headers.get("Content-Type", "").startswith("application/json") else None),
-    }
-
-def extract_fields_df(schema_payload):
-    """
-    Essaie d'extraire la liste des champs sous forme de DataFrame,
-    quel que soit le format retourné.
-    On est tolérant : si on ne trouve pas, on renvoie un DF vide.
-    """
-    if not schema_payload:
-        return pd.DataFrame()
-
-    js = schema_payload.get("json")
-    if not isinstance(js, dict):
-        return pd.DataFrame()
-
-    # On essaie différentes clés possibles :
-    # 1) structure attendue: {"dataset": {"fields": [ {...}, {...} ]}}
-    if "dataset" in js and isinstance(js["dataset"], dict):
-        maybe_fields = js["dataset"].get("fields")
-        if isinstance(maybe_fields, list):
-            return pd.DataFrame(maybe_fields)
-
-    # 2) parfois c'est renvoyé direct: {"fields": [...]}
-    if "fields" in js and isinstance(js["fields"], list):
-        return pd.DataFrame(js["fields"])
-
-    # 3) fallback : rien trouvé
-    return pd.DataFrame()
-
-def guess_columns(fields_df: pd.DataFrame):
-    """
-    Heuristique pour repérer les colonnes utiles.
-    Si on ne trouve rien, on renvoie juste {}
-    """
-    if fields_df.empty or "name" not in fields_df.columns:
-        return {}
-
-    def find_field(substr_list, must_all=False):
-        for name in fields_df["name"]:
-            low = str(name).lower()
-            if must_all:
-                if all(sub in low for sub in substr_list):
-                    return name
-            else:
-                if any(sub in low for sub in substr_list):
-                    return name
-        return None
-
-    date_col = find_field(["date", "time", "datetime"])
-    station_id_col = (
-        find_field(["omm", "station", "id"], must_all=True)
-        or find_field(["omm", "station"])
-        or find_field(["station", "id"])
-        or find_field(["omm"])
-    )
-    station_name_col = find_field(["station", "name"]) or find_field(["station"])
-    temp_col = find_field(["temp"]) or find_field(["temperat"])
-    rain_col = find_field(["rain", "pluie", "precip"])
-    wind_col = find_field(["wind", "vent", "ff"])
-
-    if station_id_col == station_name_col:
-        refine = find_field(["omm"]) or find_field(["id"])
-        if refine:
-            station_id_col = refine
-
-    return {
-        "date": date_col,
-        "station_id": station_id_col,
-        "station_name": station_name_col,
-        "temp": temp_col,
-        "rain": rain_col,
-        "wind": wind_col,
-    }
-
-def fetch_data_for_station(cols_map, station_id, start_dt, end_dt, limit):
-    """
-    Appel /records pour récupérer les lignes météo.
-    On construit la requête avec les noms de colonnes trouvés.
-    Si cols_map est incomplet -> on renvoie DataFrame vide + message.
-    """
-    if not cols_map:
-        st.error("❌ Pas de mapping de colonnes (le schéma est vide).")
-        return pd.DataFrame()
-
-    date_col_api = cols_map.get("date")
-    id_col_api = cols_map.get("station_id")
-
-    if not date_col_api or not id_col_api:
-        st.error(f"❌ Colonnes critiques manquantes. date={date_col_api}, station_id={id_col_api}")
-        return pd.DataFrame()
 
     start_iso = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-    end_iso = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_iso   = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    # where dynamique
+    # WHERE dynamique, avec les bons noms de colonnes (confirmés par le schéma)
     where_clause = (
-        f"`{id_col_api}` = '{station_id}' "
-        f"AND `{date_col_api}` >= '{start_iso}' "
-        f"AND `{date_col_api}` <= '{end_iso}'"
+        f"`{COL_STATION_ID}` = '{station_id}' "
+        f"AND `{COL_DATE}` >= '{start_iso}' "
+        f"AND `{COL_DATE}` <= '{end_iso}'"
     )
 
-    select_parts = [
-        f"`{date_col_api}` as date_utc",
-        f"`{id_col_api}` as station_id",
-    ]
-
-    if cols_map.get("station_name"):
-        select_parts.append(f"`{cols_map['station_name']}` as station_name")
-    if cols_map.get("temp"):
-        select_parts.append(f"`{cols_map['temp']}` as temperature_raw")
-    if cols_map.get("rain"):
-        select_parts.append(f"`{cols_map['rain']}` as rain_raw")
-    if cols_map.get("wind"):
-        select_parts.append(f"`{cols_map['wind']}` as wind_raw")
+    # SELECT : on renomme pour travailler propre ensuite
+    select_clause = ", ".join([
+        f"`{COL_DATE}` as date_utc",
+        f"`{COL_STATION_ID}` as station_id",
+        f"`{COL_NAME}` as station_name",
+        f"`{COL_TEMP}` as temperature_C",
+        f"`{COL_RAIN_1H}` as rain_mm_1h",
+        f"`{COL_WIND}` as wind_ms"
+    ])
 
     params = {
         "where": where_clause,
-        "limit": limit,
-        "order_by": f"`{date_col_api}` ASC",
-        "select": ", ".join(select_parts),
+        "order_by": f"`{COL_DATE}` ASC",
+        "limit": int(limit),
+        "select": select_clause,
     }
 
     r = requests.get(BASE_RECORDS_URL, params=params, timeout=30)
 
-    # On remonte TOUJOURS le statut et la réponse, même si 200,
-    # pour qu'on voie enfin ce que l'API retourne réellement
+    # debug doux -> ça s'affiche toujours pour qu'on puisse inspecter si souci
     st.write("🛰️ DEBUG /records status_code:", r.status_code)
     st.write("🛰️ DEBUG URL appelée:", r.url)
-    st.write("🛰️ DEBUG réponse (début):", r.text[:500])
 
     if r.status_code != 200:
+        st.write("🛰️ DEBUG Réponse brute:", r.text[:500])
+        st.error("Erreur API sur /records")
         return pd.DataFrame()
 
     try:
         data_json = r.json()
     except Exception:
+        st.write("🛰️ DEBUG Réponse brute JSON invalide:", r.text[:500])
+        st.error("Réponse API illisible (pas du JSON)")
         return pd.DataFrame()
 
     results = data_json.get("results", [])
-    return pd.DataFrame(results)
+    df = pd.DataFrame(results)
+    return df
 
-def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
+
+# ------------------------------
+# NORMALISATION DES DONNÉES
+# ------------------------------
+
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Transforme la réponse brute en colonnes prêtes à afficher.
+    - parse des dates UTC
+    - convertit en Europe/Paris pour affichage lisible
+    - renomme clairement les colonnes
     """
     if df.empty:
         return df
@@ -204,94 +116,64 @@ def normalize_synop_df(df: pd.DataFrame) -> pd.DataFrame:
     out["station_id"] = df.get("station_id")
     out["station_name"] = df.get("station_name")
 
-    if "temperature_raw" in df.columns:
-        t_raw = pd.to_numeric(df["temperature_raw"], errors="coerce")
-        out["temperature_C"] = t_raw.where(t_raw < 200, t_raw - 273.15)
-    else:
-        out["temperature_C"] = None
+    # température déjà en °C (champ tc)
+    out["temperature_C"] = pd.to_numeric(df.get("temperature_C"), errors="coerce")
 
-    if "rain_raw" in df.columns:
-        out["pluie_brute"] = pd.to_numeric(df["rain_raw"], errors="coerce")
-    else:
-        out["pluie_brute"] = None
+    # pluie dernière heure en mm
+    out["rain_mm_1h"] = pd.to_numeric(df.get("rain_mm_1h"), errors="coerce")
 
-    if "wind_raw" in df.columns:
-        out["vent_brut"] = pd.to_numeric(df["wind_raw"], errors="coerce")
-    else:
-        out["vent_brut"] = None
+    # vent moyen en m/s
+    out["wind_ms"] = pd.to_numeric(df.get("wind_ms"), errors="coerce")
 
     out = out.sort_values("date_local").reset_index(drop=True)
     return out
 
 
-# -------------------------------------------------
-# 2. CHARGER LE SCHÉMA + AFFICHER DEBUG
-# -------------------------------------------------
+# ------------------------------
+# STREAMLIT UI
+# ------------------------------
 
-schema_payload = raw_get_schema_json()
-schema_df = extract_fields_df(schema_payload)
-cols_map = guess_columns(schema_df)
+st.header("Paramètres")
 
-with st.expander("🔎 Debug schéma / colonnes"):
-    st.write("Réponse brute du schéma (/catalog … include_schema=true) :")
-    st.json(schema_payload)
+# Choix station
+station_codes = list(STATIONS.keys())
+station_labels = [f"{STATIONS[c]} ({c})" for c in station_codes]
 
-    st.write("DataFrame des champs détectés :")
-    if schema_df.empty:
-        st.warning("⚠ Pas de champs détectés (schema_df est vide).")
-    else:
-        show_cols = [c for c in ["name", "type", "label", "description"] if c in schema_df.columns]
-        st.dataframe(schema_df[show_cols], use_container_width=True)
+station_idx = st.selectbox(
+    "Station météo",
+    options=range(len(station_codes)),
+    format_func=lambda i: station_labels[i],
+)
 
-    st.write("Mapping heuristique actuel :")
-    st.json(cols_map)
+chosen_station_id = station_codes[station_idx]
+chosen_station_name = STATIONS[chosen_station_id]
 
+st.write(f"ID OMM station : {chosen_station_id}")
+st.write(f"Nom affiché : {chosen_station_name}")
 
-# -------------------------------------------------
-# 3. SIDEBAR (PARAMÈTRES UTILISATEUR)
-# -------------------------------------------------
+# Période par défaut = dernière journée UTC
+default_end = datetime.utcnow()
+default_start = default_end - timedelta(days=1)
 
-with st.sidebar:
-    st.header("⚙️ Paramètres")
-
-    station_codes = list(STATIONS.keys())
-    station_labels = [f"{STATIONS[c]} ({c})" for c in station_codes]
-
-    station_idx = st.selectbox(
-        "Station météo",
-        options=range(len(station_codes)),
-        format_func=lambda i: station_labels[i],
-    )
-
-    chosen_station_id = station_codes[station_idx]
-    chosen_station_name = STATIONS[chosen_station_id]
-
-    st.write(f"ID (station OMM supposé) : `{chosen_station_id}`")
-    st.write(f"Nom affiché : {chosen_station_name}")
-
-    default_end = datetime.utcnow()
-    default_start = default_end - timedelta(days=2)
-
+col1, col2 = st.columns(2)
+with col1:
     start_date = st.date_input("Date début (UTC)", default_start.date())
-    end_date = st.date_input("Date fin (UTC)", default_end.date())
-
     start_hour = st.number_input("Heure début (0-23)", min_value=0, max_value=23, value=0)
+with col2:
+    end_date = st.date_input("Date fin (UTC)", default_end.date())
     end_hour = st.number_input("Heure fin (0-23)", min_value=0, max_value=23, value=23)
 
-    limit = st.slider(
-        "Nombre max de lignes (<=100)",
-        min_value=10,
-        max_value=100,
-        value=50,
-        step=10,
-    )
+limit = st.slider(
+    "Nombre max de lignes renvoyées (<=100)",
+    min_value=10,
+    max_value=100,
+    value=50,
+    step=10,
+)
 
-    run_query = st.button("🔍 Charger les données")
+run_query = st.button("🔍 Charger les données")
 
-
-# -------------------------------------------------
-# 4. APPEL MESURES + PLOTS
-# -------------------------------------------------
+st.markdown("---")
 
 if run_query:
     start_dt = datetime(
@@ -302,6 +184,7 @@ if run_query:
         minute=0,
         second=0,
     )
+
     end_dt = datetime(
         year=end_date.year,
         month=end_date.month,
@@ -311,22 +194,23 @@ if run_query:
         second=0,
     )
 
-    with st.spinner("Appel API mesures /records..."):
-        raw_df = fetch_data_for_station(cols_map, chosen_station_id, start_dt, end_dt, limit)
-        synop_df = normalize_synop_df(raw_df)
+    with st.spinner("Appel API /records avec les bons champs..."):
+        raw_df = fetch_data_for_station(chosen_station_id, start_dt, end_dt, limit)
+        norm_df = normalize_df(raw_df)
 
-    if synop_df.empty:
-        st.warning("Aucune donnée renvoyée (ou mapping pas encore bon). Regarde le debug juste au-dessus.")
+    if norm_df.empty:
+        st.warning("Aucune donnée reçue pour cette station/période (ou limite trop petite).")
     else:
         st.subheader("Aperçu des données normalisées")
-        st.dataframe(synop_df.tail(20), use_container_width=True)
+        st.dataframe(norm_df.tail(20), use_container_width=True)
 
-        if synop_df["temperature_C"].notna().any():
+        # Température °C
+        if norm_df["temperature_C"].notna().any():
             fig_temp = px.line(
-                synop_df,
+                norm_df,
                 x="date_local",
                 y="temperature_C",
-                title="Température (°C estimée)",
+                title="Température (°C)",
                 markers=True,
             )
             fig_temp.update_layout(
@@ -334,33 +218,41 @@ if run_query:
                 yaxis_title="°C",
             )
             st.plotly_chart(fig_temp, use_container_width=True)
+        else:
+            st.info("Pas de température exploitable sur la période.")
 
-        if synop_df["pluie_brute"].notna().any():
+        # Pluie mm/1h
+        if norm_df["rain_mm_1h"].notna().any():
             fig_rain = px.bar(
-                synop_df,
+                norm_df,
                 x="date_local",
-                y="pluie_brute",
-                title="Pluie (valeur brute API)",
+                y="rain_mm_1h",
+                title="Précipitations (mm sur la dernière heure)",
             )
             fig_rain.update_layout(
                 xaxis_title="Heure (Europe/Paris)",
-                yaxis_title="Pluie (unité API)",
+                yaxis_title="mm / h",
             )
             st.plotly_chart(fig_rain, use_container_width=True)
+        else:
+            st.info("Pas de précipitation mesurée (ou pas de champ rr1 dispo).")
 
-        if synop_df["vent_brut"].notna().any():
+        # Vent m/s
+        if norm_df["wind_ms"].notna().any():
             fig_wind = px.line(
-                synop_df,
+                norm_df,
                 x="date_local",
-                y="vent_brut",
-                title="Vent moyen (valeur brute API)",
+                y="wind_ms",
+                title="Vent moyen 10 min (m/s)",
                 markers=True,
             )
             fig_wind.update_layout(
                 xaxis_title="Heure (Europe/Paris)",
-                yaxis_title="Vent (unité API)",
+                yaxis_title="m/s",
             )
             st.plotly_chart(fig_wind, use_container_width=True)
+        else:
+            st.info("Pas de vent exploitable (champ ff vide ?).")
 
 else:
-    st.info("➡ Choisis une station, une période et clique sur 'Charger les données'.")
+    st.info("➡ Règle la période puis clique sur 'Charger les données'.")
